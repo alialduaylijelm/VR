@@ -1,20 +1,26 @@
 from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from typing import List, Optional
+from pydantic import BaseModel, Field
+from typing import List, Optional, Any, Dict
 from uuid import uuid4
 import psycopg2
+from psycopg2.extras import Json
 import os
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 
-app = FastAPI(title="Usability World Day AR Backend", version="1.1")
+app = FastAPI(
+    title="Usability World Day AR Backend",
+    version="1.1"
+)
 
 def db():
+    # Render/Neon غالبًا يحتاج SSL
     return psycopg2.connect(DATABASE_URL)
 
 # ------------------------
 # Models
 # ------------------------
+
 class RegisterRequest(BaseModel):
     deviceId: str
 
@@ -28,30 +34,42 @@ class AutoZoneRequest(BaseModel):
     lng: float
 
 class CollectibleRequest(BaseModel):
-    type: str            # UI / UX / GOLD
+    type: str = Field(..., description="UI / UX / GOLD")
     points: int
-    matrix: list         # 16 floats
+    matrix: List[float]  # 16 float
 
 class CollectibleDTO(BaseModel):
     id: str
     type: str
     points: int
-    matrix: list
+    matrix: List[float]
+
+class LeaderboardRow(BaseModel):
+    name: str
+    points: int
 
 # ------------------------
 # Users
 # ------------------------
+
 @app.post("/users/register")
 def register_guest(req: RegisterRequest):
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, name, is_guest, points FROM users WHERE device_id=%s", (req.deviceId,))
+    cur.execute("SELECT id, zone_id, points FROM users WHERE device_id=%s", (req.deviceId,))
     row = cur.fetchone()
 
     if row:
+        user_id, zone_id, points = row
         conn.close()
-        return {"userId": row[0], "name": row[1] or "Guest", "isGuest": row[2], "points": row[3]}
+        return {
+            "userId": user_id,
+            "name": "Guest",
+            "isGuest": True,
+            "zoneId": zone_id,
+            "points": points or 0
+        }
 
     user_id = str(uuid4())
     cur.execute(
@@ -64,7 +82,13 @@ def register_guest(req: RegisterRequest):
     conn.commit()
     conn.close()
 
-    return {"userId": user_id, "name": "Guest", "isGuest": True, "points": 0}
+    return {
+        "userId": user_id,
+        "name": "Guest",
+        "isGuest": True,
+        "zoneId": None,
+        "points": 0
+    }
 
 @app.post("/users/claim")
 def claim_user(req: ClaimRequest):
@@ -80,55 +104,30 @@ def claim_user(req: ClaimRequest):
         (req.name, req.email, req.userId)
     )
 
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(404, detail="User not found")
+
     conn.commit()
     conn.close()
+
     return {"ok": True}
 
 # ------------------------
-# Zones (auto: nearest existing within radius, else create)
+# Zones
 # ------------------------
+
 @app.post("/zones/auto")
-def auto_zone(req: AutoZoneRequest, radius_m: int = 400):
+def auto_zone(req: AutoZoneRequest):
     """
-    يرجع أقرب zone موجودة ضمن radius (بالمتر).
-    إذا ما فيه، ينشئ zone جديدة.
+    Creates a new zone and returns zoneId + joinCode.
+    (بسيطة للتجربة، لاحقًا ممكن نخليها تعيد نفس الـ zone حسب الموقع)
     """
-    conn = db()
-    cur = conn.cursor()
-
-    # Approx distance in meters (simple equirectangular-ish using degrees):
-    # 1 deg lat ~ 111_000m, 1 deg lng ~ 111_000m * cos(lat)
-    # We'll compare squared distance to avoid heavy funcs.
-    cur.execute(
-        """
-        SELECT id, join_code, lat, lng
-        FROM zones
-        """
-    )
-    zones = cur.fetchall()
-
-    best = None
-    best_d2 = None
-    for z in zones:
-        zid, code, zlat, zlng = z
-        if zlat is None or zlng is None:
-            continue
-        dx = (req.lat - zlat) * 111000.0
-        dy = (req.lng - zlng) * 111000.0
-        d2 = dx*dx + dy*dy
-        if best_d2 is None or d2 < best_d2:
-            best_d2 = d2
-            best = (zid, code)
-
-    if best is not None and best_d2 is not None:
-        if best_d2 <= (radius_m * radius_m):
-            conn.close()
-            return {"zoneId": str(best[0]), "joinCode": best[1]}
-
-    # create new zone
     zone_id = str(uuid4())
     join_code = zone_id[:6].upper()
 
+    conn = db()
+    cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO zones (id, join_code, lat, lng)
@@ -141,93 +140,106 @@ def auto_zone(req: AutoZoneRequest, radius_m: int = 400):
 
     return {"zoneId": zone_id, "joinCode": join_code}
 
+@app.post("/zones/{zone_id}/join")
+def join_zone(zone_id: str, userId: str = Query(...)):
+    """
+    Assign a user to a zone.
+    """
+    conn = db()
+    cur = conn.cursor()
+
+    # Ensure zone exists
+    cur.execute("SELECT id FROM zones WHERE id=%s", (zone_id,))
+    if not cur.fetchone():
+        conn.close()
+        raise HTTPException(404, detail="Zone not found")
+
+    cur.execute("UPDATE users SET zone_id=%s WHERE id=%s", (zone_id, userId))
+    if cur.rowcount == 0:
+        conn.close()
+        raise HTTPException(404, detail="User not found")
+
+    conn.commit()
+    conn.close()
+    return {"ok": True, "zoneId": zone_id}
+
 # ------------------------
 # Collectibles
 # ------------------------
-@app.get("/zones/{zone_id}/collectibles", response_model=List[CollectibleDTO])
-def list_collectibles(zone_id: str):
-    conn = db()
-    cur = conn.cursor()
 
-    cur.execute(
-        """
-        SELECT id, type, points, matrix
-        FROM collectibles
-        WHERE zone_id=%s
-        ORDER BY created_at ASC
-        """,
-        (zone_id,)
-    )
-
-    data = [{"id": r[0], "type": r[1], "points": r[2], "matrix": r[3]} for r in cur.fetchall()]
-    conn.close()
-    return data
-
-@app.post("/zones/{zone_id}/collectibles", response_model=CollectibleDTO)
+@app.post("/zones/{zone_id}/collectibles")
 def create_collectible(zone_id: str, req: CollectibleRequest):
+    """
+    Create a collectible inside a zone.
+    """
     cid = str(uuid4())
+
     conn = db()
     cur = conn.cursor()
 
+    # ensure zone exists (avoid FK 500)
+    cur.execute("SELECT id FROM zones WHERE id=%s", (zone_id,))
+    if not cur.fetchone():
+        conn.close()
+        raise HTTPException(404, detail="Zone not found")
+
+    # ✅ Important: wrap matrix with Json() so psycopg2 stores it properly
     cur.execute(
         """
         INSERT INTO collectibles (id, zone_id, type, points, matrix)
         VALUES (%s,%s,%s,%s,%s)
         """,
-        (cid, zone_id, req.type, req.points, req.matrix)
+        (cid, zone_id, req.type, req.points, Json(req.matrix))
     )
+
     conn.commit()
     conn.close()
+    return {"id": cid}
 
-    return {"id": cid, "type": req.type, "points": req.points, "matrix": req.matrix}
+@app.get("/zones/{zone_id}/collectibles", response_model=List[CollectibleDTO])
+def list_collectibles(zone_id: str):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT id, type, points, matrix FROM collectibles WHERE zone_id=%s", (zone_id,))
+    rows = cur.fetchall()
+    conn.close()
+
+    return [
+        {"id": r[0], "type": r[1], "points": r[2], "matrix": r[3]}
+        for r in rows
+    ]
 
 @app.post("/collectibles/{collectible_id}/collect")
 def collect_item(collectible_id: str, userId: str = Query(...)):
     conn = db()
     cur = conn.cursor()
 
-    # find collectible + zone
+    # get collectible (and its zone)
     cur.execute(
-        "SELECT zone_id, points FROM collectibles WHERE id=%s",
+        "SELECT points, zone_id FROM collectibles WHERE id=%s",
         (collectible_id,)
     )
     row = cur.fetchone()
     if not row:
         conn.close()
-        raise HTTPException(404, "Collectible not found")
+        raise HTTPException(404, detail="Collectible not found")
 
-    zone_id, points = row[0], row[1]
+    points, zone_id = row
 
-    # prevent double collect
-    cur.execute(
-        """
-        INSERT INTO collected_items (collectible_id, user_id)
-        VALUES (%s, %s)
-        ON CONFLICT DO NOTHING
-        """,
-        (collectible_id, userId)
-    )
-    if cur.rowcount == 0:
+    # ensure user exists
+    cur.execute("SELECT id FROM users WHERE id=%s", (userId,))
+    if not cur.fetchone():
         conn.close()
-        raise HTTPException(409, "Already collected")
+        raise HTTPException(404, detail="User not found")
 
-    # ensure user is member of this zone (for leaderboard)
+    # add points + bind zone (optional but helpful)
     cur.execute(
-        """
-        INSERT INTO zone_members (zone_id, user_id)
-        VALUES (%s, %s)
-        ON CONFLICT DO NOTHING
-        """,
-        (zone_id, userId)
+        "UPDATE users SET points = COALESCE(points,0) + %s, zone_id = COALESCE(zone_id,%s) WHERE id=%s",
+        (points, zone_id, userId)
     )
 
-    # add points
-    cur.execute(
-        "UPDATE users SET points = points + %s WHERE id=%s",
-        (points, userId)
-    )
-
-    # delete collectible after collection
+    # delete collectible (one-time)
     cur.execute("DELETE FROM collectibles WHERE id=%s", (collectible_id,))
 
     conn.commit()
@@ -236,25 +248,34 @@ def collect_item(collectible_id: str, userId: str = Query(...)):
     return {"points": points}
 
 # ------------------------
-# Leaderboard (per zone)
+# Leaderboard
 # ------------------------
-@app.get("/zones/{zone_id}/leaderboard")
+
+@app.get("/zones/{zone_id}/leaderboard", response_model=List[LeaderboardRow])
 def leaderboard(zone_id: str):
     conn = db()
     cur = conn.cursor()
 
+    # ✅ leaderboard per zone + exclude guests (optional)
     cur.execute(
         """
-        SELECT u.name, u.points
-        FROM users u
-        JOIN zone_members zm ON zm.user_id = u.id
-        WHERE zm.zone_id = %s
-        ORDER BY u.points DESC
+        SELECT name, points
+        FROM users
+        WHERE zone_id=%s AND is_guest=false
+        ORDER BY points DESC
         LIMIT 10
         """,
         (zone_id,)
     )
 
-    data = [{"name": r[0], "points": r[1]} for r in cur.fetchall()]
+    data = [{"name": r[0], "points": r[1] or 0} for r in cur.fetchall()]
     conn.close()
     return data
+
+# ------------------------
+# Health
+# ------------------------
+
+@app.get("/health")
+def health():
+    return {"ok": True}
