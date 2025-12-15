@@ -1,120 +1,72 @@
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Literal
 from uuid import uuid4
+from datetime import datetime
 import psycopg2
-from psycopg2.extras import Json
+import psycopg2.extras
 import os
 import re
 
-DATABASE_URL = os.environ["DATABASE_URL"]
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing")
 
 app = FastAPI(title="Usability World Day AR Backend", version="2.0")
 
 
 # ------------------------
-# DB
+# DB Helpers
 # ------------------------
 def db():
-    return psycopg2.connect(DATABASE_URL)
+    # DictCursor عشان ترجع dict بدل tuple
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
-
-# ------------------------
-# Models
-# ------------------------
-class RegisterRequest(BaseModel):
-    deviceId: str
-
-
-class ClaimRequest(BaseModel):
-    userId: str
-    name: str
-    email: str  # ✅ بدون EmailStr عشان ما يحتاج email-validator
-
-
-class AutoZoneRequest(BaseModel):
-    lat: float
-    lng: float
-
-
-class CollectibleRequest(BaseModel):
-    type: str          # UI / UX / GOLD
-    points: int
-    matrix: List[float]  # 16 floats
-
-
-class CollectibleDTO(BaseModel):
-    id: str
-    type: str
-    points: int
-    matrix: List[float]
-
-
-class LeaderboardEntry(BaseModel):
-    name: str
-    points: int
-
-
-class CollectResponse(BaseModel):
-    awardedPoints: int
-    totalPoints: int
-
-
-# ------------------------
-# Helpers
-# ------------------------
-EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-def ensure_schema():
-    """
-    Creates tables if they do not exist.
-    Uses jsonb for matrix to make it easy.
-    Uses a zone leaderboard table user_zone_points (per user per zone).
-    """
+def init_db():
     conn = db()
     cur = conn.cursor()
 
+    # tables
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY,
-        device_id TEXT UNIQUE,
+        device_id TEXT UNIQUE NOT NULL,
         name TEXT NOT NULL DEFAULT 'Guest',
         email TEXT,
-        is_guest BOOLEAN NOT NULL DEFAULT true,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        is_guest BOOLEAN NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS zones (
         id UUID PRIMARY KEY,
-        join_code TEXT UNIQUE,
+        join_code TEXT UNIQUE NOT NULL,
         lat DOUBLE PRECISION,
         lng DOUBLE PRECISION,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """)
 
-    # matrix jsonb
+    # matrix as jsonb (list of 16 floats)
     cur.execute("""
     CREATE TABLE IF NOT EXISTS collectibles (
         id UUID PRIMARY KEY,
         zone_id UUID NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
         type TEXT NOT NULL,
-        points INT NOT NULL,
+        points INTEGER NOT NULL,
         matrix JSONB NOT NULL,
-        created_at TIMESTAMP NOT NULL DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """)
 
-    # per-zone points (leaderboard by zone)
+    # points per zone
     cur.execute("""
     CREATE TABLE IF NOT EXISTS user_zone_points (
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         zone_id UUID NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
-        points INT NOT NULL DEFAULT 0,
-        updated_at TIMESTAMP NOT NULL DEFAULT NOW(),
+        points INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         PRIMARY KEY (user_id, zone_id)
     );
     """)
@@ -125,51 +77,51 @@ def ensure_schema():
 
 @app.on_event("startup")
 def on_startup():
-    ensure_schema()
-
-
-def upsert_user_zone_points(cur, user_id: str, zone_id: str, add_points: int) -> int:
-    """
-    Add points to user in a zone and return total.
-    """
-    cur.execute(
-        """
-        INSERT INTO user_zone_points (user_id, zone_id, points)
-        VALUES (%s, %s, %s)
-        ON CONFLICT (user_id, zone_id)
-        DO UPDATE SET
-            points = user_zone_points.points + EXCLUDED.points,
-            updated_at = NOW()
-        RETURNING points;
-        """,
-        (user_id, zone_id, add_points),
-    )
-    row = cur.fetchone()
-    return int(row[0]) if row else 0
-
-
-def get_user_zone_points(cur, user_id: str, zone_id: str) -> int:
-    cur.execute(
-        "SELECT points FROM user_zone_points WHERE user_id=%s AND zone_id=%s",
-        (user_id, zone_id),
-    )
-    row = cur.fetchone()
-    return int(row[0]) if row else 0
+    init_db()
 
 
 # ------------------------
-# Health
+# Models
 # ------------------------
-@app.get("/")
-def root():
-    return {"ok": True, "service": "Usability World Day AR Backend"}
+class RegisterRequest(BaseModel):
+    deviceId: str
+
+class ClaimRequest(BaseModel):
+    userId: str
+    name: str
+    email: str
+
+class AutoZoneRequest(BaseModel):
+    lat: float
+    lng: float
+
+class CollectibleRequest(BaseModel):
+    type: Literal["UI", "UX", "GOLD"]
+    points: int
+    matrix: List[float]  # لازم 16 رقم
+
+class CollectibleDTO(BaseModel):
+    id: str
+    type: str
+    points: int
+    matrix: List[float]
+
+
+# ------------------------
+# Small validators
+# ------------------------
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+def ensure_matrix_ok(m: List[float]):
+    if not isinstance(m, list) or len(m) != 16:
+        raise HTTPException(400, detail="matrix must be a list of 16 numbers")
 
 
 # ------------------------
 # Users
 # ------------------------
 @app.post("/users/register")
-def register_guest(req: RegisterRequest):
+def register_guest(req: RegisterRequest, zoneId: Optional[str] = Query(default=None)):
     conn = db()
     cur = conn.cursor()
 
@@ -177,33 +129,37 @@ def register_guest(req: RegisterRequest):
     row = cur.fetchone()
 
     if row:
-        user_id = str(row[0])
-        # points across ALL zones depends, so we return points=0 here (client can query per zone)
-        conn.close()
-        return {"userId": user_id, "name": row[1], "isGuest": bool(row[2]), "points": 0}
+        user_id = str(row["id"])
+    else:
+        user_id = str(uuid4())
+        cur.execute(
+            "INSERT INTO users (id, device_id, name, is_guest) VALUES (%s,%s,%s,true)",
+            (user_id, req.deviceId, "Guest")
+        )
 
-    user_id = str(uuid4())
-    cur.execute(
-        """
-        INSERT INTO users (id, device_id, name, is_guest)
-        VALUES (%s,%s,%s,true)
-        """,
-        (user_id, req.deviceId, "Guest"),
-    )
+    # points (optional)
+    pts = 0
+    if zoneId:
+        try:
+            cur.execute("""
+                SELECT points FROM user_zone_points
+                WHERE user_id=%s AND zone_id=%s
+            """, (user_id, zoneId))
+            p = cur.fetchone()
+            pts = int(p["points"]) if p else 0
+        except Exception:
+            pts = 0
+
     conn.commit()
     conn.close()
-    return {"userId": user_id, "name": "Guest", "isGuest": True, "points": 0}
+
+    return {"userId": user_id, "name": "Guest", "isGuest": True, "points": pts}
 
 
 @app.post("/users/claim")
 def claim_user(req: ClaimRequest):
-    name = (req.name or "").strip()
-    email = (req.email or "").strip().lower()
-
-    if len(name) < 2:
-        raise HTTPException(400, detail="name too short")
-
-    if not EMAIL_RE.match(email):
+    # تحقق إيميل بسيط بدون email-validator
+    if not EMAIL_RE.match(req.email.strip().lower()):
         raise HTTPException(400, detail="invalid email format")
 
     conn = db()
@@ -214,18 +170,30 @@ def claim_user(req: ClaimRequest):
         conn.close()
         raise HTTPException(404, detail="user not found")
 
-    cur.execute(
-        """
+    cur.execute("""
         UPDATE users
         SET name=%s, email=%s, is_guest=false
         WHERE id=%s
-        """,
-        (name, email, req.userId),
-    )
+    """, (req.name.strip(), req.email.strip().lower(), req.userId))
 
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@app.get("/users/{user_id}/points")
+def user_points(user_id: str, zoneId: str = Query(...)):
+    conn = db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT points FROM user_zone_points
+        WHERE user_id=%s AND zone_id=%s
+    """, (user_id, zoneId))
+    row = cur.fetchone()
+
+    conn.close()
+    return {"points": int(row["points"]) if row else 0}
 
 
 # ------------------------
@@ -238,13 +206,12 @@ def auto_zone(req: AutoZoneRequest):
 
     conn = db()
     cur = conn.cursor()
-    cur.execute(
-        """
+
+    cur.execute("""
         INSERT INTO zones (id, join_code, lat, lng)
         VALUES (%s,%s,%s,%s)
-        """,
-        (zone_id, join_code, req.lat, req.lng),
-    )
+    """, (zone_id, join_code, req.lat, req.lng))
+
     conn.commit()
     conn.close()
 
@@ -254,126 +221,132 @@ def auto_zone(req: AutoZoneRequest):
 # ------------------------
 # Collectibles
 # ------------------------
-@app.get("/zones/{zone_id}/collectibles", response_model=List[CollectibleDTO])
+@app.get("/zones/{zone_id}/collectibles")
 def list_collectibles(zone_id: str):
     conn = db()
     cur = conn.cursor()
-    cur.execute("SELECT id, type, points, matrix FROM collectibles WHERE zone_id=%s ORDER BY created_at DESC", (zone_id,))
+
+    cur.execute("""
+        SELECT id, type, points, matrix
+        FROM collectibles
+        WHERE zone_id=%s
+        ORDER BY created_at ASC
+    """, (zone_id,))
     rows = cur.fetchall()
+
     conn.close()
 
-    out = []
+    data = []
     for r in rows:
-        out.append(
-            {
-                "id": str(r[0]),
-                "type": r[1],
-                "points": int(r[2]),
-                "matrix": list(r[3]) if isinstance(r[3], list) else r[3],  # jsonb returns list
-            }
-        )
-    return out
+        data.append({
+            "id": str(r["id"]),
+            "type": r["type"],
+            "points": int(r["points"]),
+            "matrix": r["matrix"],  # jsonb يرجع list
+        })
+    return data
 
 
-@app.post("/zones/{zone_id}/collectibles", response_model=CollectibleDTO)
+@app.post("/zones/{zone_id}/collectibles")
 def create_collectible(zone_id: str, req: CollectibleRequest):
-    t = req.type.strip().upper()
-    if t not in ("UI", "UX", "GOLD"):
-        raise HTTPException(400, detail="type must be UI/UX/GOLD")
-
-    if len(req.matrix) != 16:
-        raise HTTPException(400, detail="matrix must contain 16 floats")
+    ensure_matrix_ok(req.matrix)
 
     cid = str(uuid4())
-
     conn = db()
     cur = conn.cursor()
 
-    # ensure zone exists
+    # تأكد zone موجود
     cur.execute("SELECT id FROM zones WHERE id=%s", (zone_id,))
     if not cur.fetchone():
         conn.close()
         raise HTTPException(404, detail="zone not found")
 
-    cur.execute(
-        """
-        INSERT INTO collectibles (id, zone_id, type, points, matrix)
-        VALUES (%s,%s,%s,%s,%s)
-        """,
-        (cid, zone_id, t, req.points, Json(req.matrix)),  # ✅ أهم تعديل
-    )
+    try:
+        cur.execute("""
+            INSERT INTO collectibles (id, zone_id, type, points, matrix)
+            VALUES (%s,%s,%s,%s,%s::jsonb)
+            RETURNING id, type, points, matrix
+        """, (cid, zone_id, req.type, req.points, psycopg2.extras.Json(req.matrix)))
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        raise HTTPException(500, detail=f"db insert error: {str(e)}")
+
+    row = cur.fetchone()
     conn.commit()
     conn.close()
 
-    return {"id": cid, "type": t, "points": req.points, "matrix": req.matrix}
+    return {
+        "id": str(row["id"]),
+        "type": row["type"],
+        "points": int(row["points"]),
+        "matrix": row["matrix"],
+    }
 
 
-@app.post("/collectibles/{collectible_id}/collect", response_model=CollectResponse)
+@app.post("/collectibles/{collectible_id}/collect")
 def collect_item(collectible_id: str, userId: str = Query(...)):
     conn = db()
     cur = conn.cursor()
 
-    # get collectible
-    cur.execute("SELECT zone_id, points FROM collectibles WHERE id=%s", (collectible_id,))
-    row = cur.fetchone()
-    if not row:
+    # جيب العنصر
+    cur.execute("""
+        SELECT id, zone_id, type, points
+        FROM collectibles
+        WHERE id=%s
+    """, (collectible_id,))
+    item = cur.fetchone()
+    if not item:
         conn.close()
         raise HTTPException(404, detail="collectible not found")
 
-    zone_id = str(row[0])
-    awarded = int(row[1])
+    zone_id = str(item["zone_id"])
+    pts = int(item["points"])
 
-    # ensure user exists
+    # تأكد user موجود
     cur.execute("SELECT id FROM users WHERE id=%s", (userId,))
     if not cur.fetchone():
         conn.close()
         raise HTTPException(404, detail="user not found")
 
-    # add points to this zone leaderboard table
-    total = upsert_user_zone_points(cur, userId, zone_id, awarded)
+    # upsert نقاط الزون
+    cur.execute("""
+        INSERT INTO user_zone_points (user_id, zone_id, points)
+        VALUES (%s,%s,%s)
+        ON CONFLICT (user_id, zone_id)
+        DO UPDATE SET points = user_zone_points.points + EXCLUDED.points,
+                      updated_at = NOW()
+        RETURNING points
+    """, (userId, zone_id, pts))
+    new_total = int(cur.fetchone()["points"])
 
-    # delete collectible so no one can collect twice
+    # احذف العنصر من العالم
     cur.execute("DELETE FROM collectibles WHERE id=%s", (collectible_id,))
 
     conn.commit()
     conn.close()
 
-    return {"awardedPoints": awarded, "totalPoints": total}
+    return {"awardedPoints": pts, "totalPoints": new_total, "zoneId": zone_id}
 
 
 # ------------------------
-# Points (per zone)
+# Leaderboard
 # ------------------------
-@app.get("/zones/{zone_id}/users/{user_id}/points")
-def user_points(zone_id: str, user_id: str):
-    conn = db()
-    cur = conn.cursor()
-    pts = get_user_zone_points(cur, user_id, zone_id)
-    conn.close()
-    return {"points": pts}
-
-
-# ------------------------
-# Leaderboard (per zone)
-# ------------------------
-@app.get("/zones/{zone_id}/leaderboard", response_model=List[LeaderboardEntry])
-def leaderboard(zone_id: str):
+@app.get("/zones/{zone_id}/leaderboard")
+def leaderboard(zone_id: str, limit: int = 10):
     conn = db()
     cur = conn.cursor()
 
-    # Top 10 for this zone
-    cur.execute(
-        """
+    cur.execute("""
         SELECT u.name, uz.points
         FROM user_zone_points uz
         JOIN users u ON u.id = uz.user_id
-        WHERE uz.zone_id = %s
-        ORDER BY uz.points DESC, uz.updated_at DESC
-        LIMIT 10
-        """,
-        (zone_id,),
-    )
+        WHERE uz.zone_id=%s
+        ORDER BY uz.points DESC
+        LIMIT %s
+    """, (zone_id, limit))
+
     rows = cur.fetchall()
     conn.close()
 
-    return [{"name": r[0], "points": int(r[1])} for r in rows]
+    return [{"name": r["name"], "points": int(r["points"])} for r in rows]
