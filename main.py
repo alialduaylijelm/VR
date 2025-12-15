@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from typing import List, Optional, Literal
 from uuid import uuid4
-from datetime import datetime
 import psycopg2
 import psycopg2.extras
 import os
@@ -12,21 +11,15 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing")
 
-app = FastAPI(title="Usability World Day AR Backend", version="2.0")
+app = FastAPI(title="Usability World Day AR Backend", version="2.1")
 
-
-# ------------------------
-# DB Helpers
-# ------------------------
 def db():
-    # DictCursor عشان ترجع dict بدل tuple
     return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def init_db():
     conn = db()
     cur = conn.cursor()
 
-    # tables
     cur.execute("""
     CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY,
@@ -48,19 +41,18 @@ def init_db():
     );
     """)
 
-    # matrix as jsonb (list of 16 floats)
+    # ✅ matrix as DOUBLE PRECISION[]
     cur.execute("""
     CREATE TABLE IF NOT EXISTS collectibles (
         id UUID PRIMARY KEY,
         zone_id UUID NOT NULL REFERENCES zones(id) ON DELETE CASCADE,
         type TEXT NOT NULL,
         points INTEGER NOT NULL,
-        matrix JSONB NOT NULL,
+        matrix DOUBLE PRECISION[] NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     """)
 
-    # points per zone
     cur.execute("""
     CREATE TABLE IF NOT EXISTS user_zone_points (
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -74,11 +66,9 @@ def init_db():
     conn.commit()
     conn.close()
 
-
 @app.on_event("startup")
 def on_startup():
     init_db()
-
 
 # ------------------------
 # Models
@@ -98,24 +88,13 @@ class AutoZoneRequest(BaseModel):
 class CollectibleRequest(BaseModel):
     type: Literal["UI", "UX", "GOLD"]
     points: int
-    matrix: List[float]  # لازم 16 رقم
+    matrix: List[float]  # 16 numbers
 
-class CollectibleDTO(BaseModel):
-    id: str
-    type: str
-    points: int
-    matrix: List[float]
-
-
-# ------------------------
-# Small validators
-# ------------------------
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 def ensure_matrix_ok(m: List[float]):
     if not isinstance(m, list) or len(m) != 16:
         raise HTTPException(400, detail="matrix must be a list of 16 numbers")
-
 
 # ------------------------
 # Users
@@ -125,7 +104,7 @@ def register_guest(req: RegisterRequest, zoneId: Optional[str] = Query(default=N
     conn = db()
     cur = conn.cursor()
 
-    cur.execute("SELECT id, name, is_guest FROM users WHERE device_id=%s", (req.deviceId,))
+    cur.execute("SELECT id FROM users WHERE device_id=%s", (req.deviceId,))
     row = cur.fetchone()
 
     if row:
@@ -137,28 +116,22 @@ def register_guest(req: RegisterRequest, zoneId: Optional[str] = Query(default=N
             (user_id, req.deviceId, "Guest")
         )
 
-    # points (optional)
     pts = 0
     if zoneId:
-        try:
-            cur.execute("""
-                SELECT points FROM user_zone_points
-                WHERE user_id=%s AND zone_id=%s
-            """, (user_id, zoneId))
-            p = cur.fetchone()
-            pts = int(p["points"]) if p else 0
-        except Exception:
-            pts = 0
+        cur.execute("""
+            SELECT points FROM user_zone_points
+            WHERE user_id=%s AND zone_id=%s
+        """, (user_id, zoneId))
+        p = cur.fetchone()
+        pts = int(p["points"]) if p else 0
 
     conn.commit()
     conn.close()
 
     return {"userId": user_id, "name": "Guest", "isGuest": True, "points": pts}
 
-
 @app.post("/users/claim")
 def claim_user(req: ClaimRequest):
-    # تحقق إيميل بسيط بدون email-validator
     if not EMAIL_RE.match(req.email.strip().lower()):
         raise HTTPException(400, detail="invalid email format")
 
@@ -180,21 +153,17 @@ def claim_user(req: ClaimRequest):
     conn.close()
     return {"ok": True}
 
-
 @app.get("/users/{user_id}/points")
 def user_points(user_id: str, zoneId: str = Query(...)):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("""
         SELECT points FROM user_zone_points
         WHERE user_id=%s AND zone_id=%s
     """, (user_id, zoneId))
     row = cur.fetchone()
-
     conn.close()
     return {"points": int(row["points"]) if row else 0}
-
 
 # ------------------------
 # Zones
@@ -206,17 +175,14 @@ def auto_zone(req: AutoZoneRequest):
 
     conn = db()
     cur = conn.cursor()
-
     cur.execute("""
         INSERT INTO zones (id, join_code, lat, lng)
         VALUES (%s,%s,%s,%s)
     """, (zone_id, join_code, req.lat, req.lng))
-
     conn.commit()
     conn.close()
 
     return {"zoneId": zone_id, "joinCode": join_code}
-
 
 # ------------------------
 # Collectibles
@@ -225,7 +191,6 @@ def auto_zone(req: AutoZoneRequest):
 def list_collectibles(zone_id: str):
     conn = db()
     cur = conn.cursor()
-
     cur.execute("""
         SELECT id, type, points, matrix
         FROM collectibles
@@ -233,65 +198,58 @@ def list_collectibles(zone_id: str):
         ORDER BY created_at ASC
     """, (zone_id,))
     rows = cur.fetchall()
-
     conn.close()
 
-    data = []
-    for r in rows:
-        data.append({
-            "id": str(r["id"]),
-            "type": r["type"],
-            "points": int(r["points"]),
-            "matrix": r["matrix"],  # jsonb يرجع list
-        })
-    return data
-
+    return [{
+        "id": str(r["id"]),
+        "type": r["type"],
+        "points": int(r["points"]),
+        "matrix": list(r["matrix"])
+    } for r in rows]
 
 @app.post("/zones/{zone_id}/collectibles")
 def create_collectible(zone_id: str, req: CollectibleRequest):
     ensure_matrix_ok(req.matrix)
 
-    cid = str(uuid4())
     conn = db()
     cur = conn.cursor()
 
-    # تأكد zone موجود
     cur.execute("SELECT id FROM zones WHERE id=%s", (zone_id,))
     if not cur.fetchone():
         conn.close()
         raise HTTPException(404, detail="zone not found")
 
+    cid = str(uuid4())
+
     try:
         cur.execute("""
             INSERT INTO collectibles (id, zone_id, type, points, matrix)
-            VALUES (%s,%s,%s,%s,%s::jsonb)
+            VALUES (%s,%s,%s,%s,%s)
             RETURNING id, type, points, matrix
-        """, (cid, zone_id, req.type, req.points, psycopg2.extras.Json(req.matrix)))
+        """, (cid, zone_id, req.type, req.points, req.matrix))
+        row = cur.fetchone()
+        conn.commit()
     except Exception as e:
         conn.rollback()
         conn.close()
         raise HTTPException(500, detail=f"db insert error: {str(e)}")
 
-    row = cur.fetchone()
-    conn.commit()
     conn.close()
 
     return {
         "id": str(row["id"]),
         "type": row["type"],
         "points": int(row["points"]),
-        "matrix": row["matrix"],
+        "matrix": list(row["matrix"])
     }
-
 
 @app.post("/collectibles/{collectible_id}/collect")
 def collect_item(collectible_id: str, userId: str = Query(...)):
     conn = db()
     cur = conn.cursor()
 
-    # جيب العنصر
     cur.execute("""
-        SELECT id, zone_id, type, points
+        SELECT id, zone_id, points
         FROM collectibles
         WHERE id=%s
     """, (collectible_id,))
@@ -303,13 +261,11 @@ def collect_item(collectible_id: str, userId: str = Query(...)):
     zone_id = str(item["zone_id"])
     pts = int(item["points"])
 
-    # تأكد user موجود
     cur.execute("SELECT id FROM users WHERE id=%s", (userId,))
     if not cur.fetchone():
         conn.close()
         raise HTTPException(404, detail="user not found")
 
-    # upsert نقاط الزون
     cur.execute("""
         INSERT INTO user_zone_points (user_id, zone_id, points)
         VALUES (%s,%s,%s)
@@ -320,14 +276,12 @@ def collect_item(collectible_id: str, userId: str = Query(...)):
     """, (userId, zone_id, pts))
     new_total = int(cur.fetchone()["points"])
 
-    # احذف العنصر من العالم
     cur.execute("DELETE FROM collectibles WHERE id=%s", (collectible_id,))
 
     conn.commit()
     conn.close()
 
     return {"awardedPoints": pts, "totalPoints": new_total, "zoneId": zone_id}
-
 
 # ------------------------
 # Leaderboard
