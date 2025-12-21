@@ -224,23 +224,27 @@ def collect_collectible(
     collectibleId: str,
     userId: str = Query(...),
 ):
-    """
-    Swift ينادي:
-    POST /collectibles/{id}/collect?userId=...
-    """
+    # ✅ FIX: إذا userId مو موجود (بسبب restart / in-memory) سجله تلقائيًا
     if userId not in users:
-        raise HTTPException(status_code=404, detail="user not found")
+        users[userId] = {
+            "userId": userId,
+            "deviceId": "",       # ما عندنا هنا
+            "isGuest": True,
+            "name": "",
+            "email": "",
+            "createdAt": now_ts(),
+        }
 
     zone_id, it = find_collectible_any_zone(collectibleId)
 
-    # احذف العنصر من الزون (انجمع)
-    collectibles_by_zone[zone_id] = [x for x in collectibles_by_zone[zone_id] if x["id"] != collectibleId]
+    collectibles_by_zone[zone_id] = [
+        x for x in collectibles_by_zone[zone_id] if x["id"] != collectibleId
+    ]
 
     gained = int(it.get("points", 0))
     key = (userId, zone_id)
     points[key] = int(points.get(key, 0)) + gained
 
-    # رجّع مجموع نقاطه في الزون (مثل Swift عندك)
     return CollectResponse(points=points[key])
 
 # ============================================================
