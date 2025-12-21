@@ -1,272 +1,377 @@
+import os
+import base64
+from datetime import datetime
+from typing import Optional, List
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Dict, List, Optional, Tuple
-from uuid import uuid4
-import time
 
-app = FastAPI(title="UX GO Backend", version="1.0.0")
+from sqlalchemy import (
+    create_engine, String, Integer, DateTime, Boolean, ForeignKey, Text,
+    select, func, UniqueConstraint
+)
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session, relationship
 
-# ============================================================
-# In-memory "DB" (بدّلها بـ Postgres لاحقًا)
-# ============================================================
-
-# users[userId] = { userId, name, isGuest, email, deviceId, createdAt }
-users: Dict[str, dict] = {}
-
-# zones[zoneId] = { zoneId, joinCode, createdAt }
-zones: Dict[str, dict] = {}
-
-# collectibles_by_zone[zoneId] = [ collectible, ... ]
-# collectible = { id, type, points, matrix, worldMapId, createdAt }
-collectibles_by_zone: Dict[str, List[dict]] = {}
-
-# points[(userId, zoneId)] = int
-points: Dict[Tuple[str, str], int] = {}
 
 # ============================================================
-# Helpers
+# DB
 # ============================================================
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    # fallback local
+    DATABASE_URL = "sqlite:///./app.db"
 
-def now_ts() -> float:
-    return time.time()
+# Render Postgres sometimes uses "postgres://", SQLAlchemy needs "postgresql://"
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-def ensure_zone(zone_id: str) -> dict:
-    if zone_id not in zones:
-        zones[zone_id] = {
-            "zoneId": zone_id,
-            "joinCode": zone_id[:6].upper(),
-            "createdAt": now_ts(),
-        }
-    return zones[zone_id]
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
-def safe_matrix(m: List[float]) -> None:
-    if not isinstance(m, list) or len(m) != 16:
-        raise HTTPException(status_code=400, detail="matrix must be 16 floats")
 
-def display_name(u: dict) -> str:
-    # إذا ما انعمل Claim، نطلع اسم لطيف
-    if not u.get("isGuest", True) and u.get("name"):
-        return u["name"]
-    # Guest مع جزء من الـ id عشان يميّزه بالليدر بورد
-    uid = u["userId"]
-    return f"Guest-{uid[:4]}"
+class Base(DeclarativeBase):
+    pass
 
-def find_collectible_any_zone(collectible_id: str) -> Tuple[str, dict]:
-    for zone_id, items in collectibles_by_zone.items():
-        for it in items:
-            if it["id"] == collectible_id:
-                return zone_id, it
-    raise HTTPException(status_code=404, detail="collectible not found")
+
+class User(Base):
+    __tablename__ = "users"
+    id: Mapped[str] = mapped_column(String, primary_key=True)          # userId (uuid string from your logic)
+    device_id: Mapped[str] = mapped_column(String, index=True)
+    name: Mapped[str] = mapped_column(String, default="Guest")
+    email: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    is_guest: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    claims = relationship("Claim", back_populates="user")
+
+
+class Claim(Base):
+    __tablename__ = "claims"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String, ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String)
+    email: Mapped[str] = mapped_column(String)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="claims")
+
+
+class Collectible(Base):
+    __tablename__ = "collectibles"
+    id: Mapped[str] = mapped_column(String, primary_key=True)          # collectible uuid string
+    zone_id: Mapped[str] = mapped_column(String, index=True)           # ✅ zoneId can be UUID OR "suhail-4"
+    type: Mapped[str] = mapped_column(String)                          # UI / UX / GOLD
+    points: Mapped[int] = mapped_column(Integer)
+    matrix_json: Mapped[str] = mapped_column(Text)                     # store 16 floats as JSON string
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Collected(Base):
+    """
+    Prevent user collecting same collectible twice
+    """
+    __tablename__ = "collected"
+    __table_args__ = (UniqueConstraint("user_id", "collectible_id", name="uq_user_collectible"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String, index=True)
+    collectible_id: Mapped[str] = mapped_column(String, index=True)
+    zone_id: Mapped[str] = mapped_column(String, index=True)
+    awarded_points: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ZoneWorldMap(Base):
+    """
+    One WorldMap per zone (building-floor)
+    """
+    __tablename__ = "zone_worldmaps"
+    zone_id: Mapped[str] = mapped_column(String, primary_key=True)
+    map_b64: Mapped[str] = mapped_column(Text)  # base64 for ARWorldMap data
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+Base.metadata.create_all(engine)
+
 
 # ============================================================
-# Models (نفس اللي Swift يتوقعه)
+# API Models
 # ============================================================
+class RegisterRequest(BaseModel):
+    deviceId: str
 
-class APIRegisterResponse(BaseModel):
+
+class RegisterResponse(BaseModel):
     userId: str
     name: str
     isGuest: bool
-    points: Optional[int] = None  # اختياري
+    points: Optional[int] = 0
+
 
 class ClaimRequest(BaseModel):
     userId: str
-    name: str = Field(min_length=1, max_length=60)
-    email: str = Field(min_length=3, max_length=120)  # بدون EmailStr لتفادي email-validator
+    name: str = Field(min_length=2, max_length=50)
+    email: str = Field(min_length=5, max_length=120)  # ✅ no EmailStr dependency
+
 
 class OkResponse(BaseModel):
     ok: bool
 
-class AutoZoneBody(BaseModel):
+
+class AutoZoneReq(BaseModel):
     lat: float
     lng: float
 
-class AutoZoneResponse(BaseModel):
+
+class AutoZoneResp(BaseModel):
     zoneId: str
     joinCode: str
+
 
 class CollectibleDTO(BaseModel):
     id: str
     type: str
     points: int
     matrix: List[float]
-    worldMapId: Optional[str] = None
 
-class CreateCollectibleBody(BaseModel):
+
+class CreateCollectibleReq(BaseModel):
     type: str
     points: int
     matrix: List[float]
-    worldMapId: Optional[str] = None  # ✅ NEW
+
 
 class CollectResponse(BaseModel):
-    points: int  # مجموع نقاط المستخدم داخل الزون (زي ما Swift يتعامل معه)
+    points: int
+
+
+class PointsResp(BaseModel):
+    points: int
+
 
 class LeaderboardEntry(BaseModel):
     name: str
     points: int
 
+
+class WorldMapUpsertReq(BaseModel):
+    mapBase64: str  # ARWorldMap as base64
+
+
+class WorldMapResp(BaseModel):
+    zoneId: str
+    mapBase64: str
+    updatedAt: str
+
+
+# ============================================================
+# APP
+# ============================================================
+app = FastAPI(title="UX GO API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # tighten later
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+def now_iso() -> str:
+    return datetime.utcnow().isoformat() + "Z"
+
+
+def ensure_user(session: Session, user_id: str) -> User:
+    u = session.get(User, user_id)
+    if not u:
+        raise HTTPException(status_code=404, detail="user not found")
+    return u
+
+
 # ============================================================
 # Users
 # ============================================================
+@app.post("/users/register", response_model=RegisterResponse)
+def register(body: RegisterRequest):
+    import uuid
+    with Session(engine) as session:
+        # reuse same user for same deviceId if exists
+        existing = session.execute(select(User).where(User.device_id == body.deviceId)).scalars().first()
+        if existing:
+            return RegisterResponse(userId=existing.id, name=existing.name, isGuest=existing.is_guest, points=0)
 
-@app.post("/users/register", response_model=APIRegisterResponse)
-def register_user(payload: dict):
-    """
-    Swift يرسل: { "deviceId": "..." }
-    """
-    device_id = payload.get("deviceId") if isinstance(payload, dict) else None
-    if not device_id:
-        raise HTTPException(status_code=400, detail="deviceId is required")
+        uid = str(uuid.uuid4())
+        u = User(id=uid, device_id=body.deviceId, name="Guest", is_guest=True)
+        session.add(u)
+        session.commit()
+        return RegisterResponse(userId=u.id, name=u.name, isGuest=u.is_guest, points=0)
 
-    # ✅ لو نفس الجهاز سجّلناه قبل، رجّع نفس المستخدم (مهم عشان ما يتغير userId كل مرة)
-    for u in users.values():
-        if u.get("deviceId") == device_id:
-            return APIRegisterResponse(
-                userId=u["userId"],
-                name=u.get("name") or display_name(u),
-                isGuest=bool(u.get("isGuest", True)),
-                points=None,
-            )
-
-    user_id = str(uuid4())
-    users[user_id] = {
-        "userId": user_id,
-        "deviceId": device_id,
-        "isGuest": True,
-        "name": "",
-        "email": "",
-        "createdAt": now_ts(),
-    }
-
-    return APIRegisterResponse(
-        userId=user_id,
-        name=display_name(users[user_id]),
-        isGuest=True,
-        points=None,
-    )
 
 @app.post("/users/claim", response_model=OkResponse)
-def claim_user(req: ClaimRequest):
-    """
-    Swift يرسل: { userId, name, email }
-    """
-    u = users.get(req.userId)
-    if not u:
-        raise HTTPException(status_code=404, detail="user not found")
+def claim(body: ClaimRequest):
+    with Session(engine) as session:
+        u = ensure_user(session, body.userId)
 
-    u["isGuest"] = False
-    u["name"] = req.name.strip()
-    u["email"] = req.email.strip().lower()
+        # basic email sanity
+        if "@" not in body.email or "." not in body.email:
+            raise HTTPException(status_code=400, detail="invalid email")
 
-    return OkResponse(ok=True)
+        u.name = body.name
+        u.email = body.email
+        u.is_guest = False
 
-@app.get("/users/{userId}/points")
-def get_user_points(userId: str, zoneId: str = Query(...)):
-    """
-    Swift ينادي: /users/{userId}/points?zoneId=...
-    ويرجع JSON: { "points": رقم }
-    """
-    ensure_zone(zoneId)
-    key = (userId, zoneId)
-    return {"points": int(points.get(key, 0))}
+        session.add(Claim(user_id=u.id, name=body.name, email=body.email))
+        session.commit()
+        return OkResponse(ok=True)
+
+
+@app.get("/users/{userId}/points", response_model=PointsResp)
+def user_points(userId: str, zoneId: str = Query(...)):
+    with Session(engine) as session:
+        ensure_user(session, userId)
+        pts = session.execute(
+            select(func.coalesce(func.sum(Collected.awarded_points), 0))
+            .where(Collected.user_id == userId, Collected.zone_id == zoneId)
+        ).scalar_one()
+        return PointsResp(points=int(pts))
+
 
 # ============================================================
 # Zones
 # ============================================================
+@app.post("/zones/auto", response_model=AutoZoneResp)
+def auto_zone(body: AutoZoneReq):
+    # Optional: keep your current logic. For now: return fixed.
+    # You can later map GPS -> building/floor if you want.
+    return AutoZoneResp(zoneId="default-zone", joinCode="0000")
 
-@app.post("/zones/auto", response_model=AutoZoneResponse)
-def auto_zone(body: AutoZoneBody):
-    """
-    أنت حاليًا تستخدم Zone ثابت عندك في Swift.
-    هذا endpoint موجود لو تبغى مستقبلًا تربطها بالموقع.
-    """
-    # مثال بسيط: نثبّت زون واحدة
-    zone_id = "449a5601-cada-489f-8fcb-ed67a1a417ba"
-    z = ensure_zone(zone_id)
-    return AutoZoneResponse(zoneId=z["zoneId"], joinCode=z["joinCode"])
 
 # ============================================================
 # Collectibles
 # ============================================================
+@app.get("/zones/{zoneId}/collectibles", response_model=list[CollectibleDTO])
+def list_collectibles(zoneId: str):
+    import json
+    with Session(engine) as session:
+        rows = session.execute(select(Collectible).where(Collectible.zone_id == zoneId)).scalars().all()
+        out: list[CollectibleDTO] = []
+        for c in rows:
+            out.append(
+                CollectibleDTO(
+                    id=c.id,
+                    type=c.type,
+                    points=c.points,
+                    matrix=json.loads(c.matrix_json),
+                )
+            )
+        return out
 
-@app.get("/zones/{zoneId}/collectibles", response_model=List[CollectibleDTO])
-def list_collectibles(
-    zoneId: str,
-    worldMapId: Optional[str] = Query(default=None)  # ✅ NEW
-):
-    ensure_zone(zoneId)
-    items = collectibles_by_zone.get(zoneId, [])
-
-    # ✅ أهم شيء لحل مشكلة “الدور الرابع يظهر بالدور الأرضي”
-    # لازم Swift يرسل worldMapId (المحفوظ/المسترجع) هنا
-    if worldMapId:
-        items = [x for x in items if x.get("worldMapId") == worldMapId]
-
-    return items
 
 @app.post("/zones/{zoneId}/collectibles", response_model=CollectibleDTO)
-def create_collectible(zoneId: str, body: CreateCollectibleBody):
-    ensure_zone(zoneId)
-    safe_matrix(body.matrix)
+def create_collectible(zoneId: str, body: CreateCollectibleReq):
+    import uuid, json
+    if len(body.matrix) != 16:
+        raise HTTPException(status_code=400, detail="matrix must have 16 floats")
 
-    dto = {
-        "id": str(uuid4()),
-        "type": body.type,
-        "points": int(body.points),
-        "matrix": body.matrix,
-        "worldMapId": body.worldMapId,  # ✅ NEW
-        "createdAt": now_ts(),
-    }
-    collectibles_by_zone.setdefault(zoneId, []).append(dto)
-    return dto
+    with Session(engine) as session:
+        cid = str(uuid.uuid4())
+        c = Collectible(
+            id=cid,
+            zone_id=zoneId,
+            type=body.type,
+            points=int(body.points),
+            matrix_json=json.dumps(body.matrix),
+        )
+        session.add(c)
+        session.commit()
+        return CollectibleDTO(id=c.id, type=c.type, points=c.points, matrix=body.matrix)
+
 
 @app.post("/collectibles/{collectibleId}/collect", response_model=CollectResponse)
-def collect_collectible(
-    collectibleId: str,
-    userId: str = Query(...),
-):
-    # ✅ FIX: إذا userId مو موجود (بسبب restart / in-memory) سجله تلقائيًا
-    if userId not in users:
-        users[userId] = {
-            "userId": userId,
-            "deviceId": "",       # ما عندنا هنا
-            "isGuest": True,
-            "name": "",
-            "email": "",
-            "createdAt": now_ts(),
-        }
+def collect(collectibleId: str, userId: str = Query(...)):
+    with Session(engine) as session:
+        u = ensure_user(session, userId)
 
-    zone_id, it = find_collectible_any_zone(collectibleId)
+        c = session.get(Collectible, collectibleId)
+        if not c:
+            raise HTTPException(status_code=404, detail="collectible not found")
 
-    collectibles_by_zone[zone_id] = [
-        x for x in collectibles_by_zone[zone_id] if x["id"] != collectibleId
-    ]
+        # prevent duplicate collect
+        already = session.execute(
+            select(Collected).where(Collected.user_id == u.id, Collected.collectible_id == collectibleId)
+        ).scalars().first()
+        if already:
+            return CollectResponse(points=0)
 
-    gained = int(it.get("points", 0))
-    key = (userId, zone_id)
-    points[key] = int(points.get(key, 0)) + gained
+        got = Collected(
+            user_id=u.id,
+            collectible_id=c.id,
+            zone_id=c.zone_id,
+            awarded_points=c.points
+        )
+        session.add(got)
 
-    return CollectResponse(points=points[key])
+        # optional: remove collectible after collected
+        session.delete(c)
+
+        session.commit()
+        return CollectResponse(points=int(got.awarded_points))
+
 
 # ============================================================
 # Leaderboard
 # ============================================================
-
-@app.get("/zones/{zoneId}/leaderboard", response_model=List[LeaderboardEntry])
+@app.get("/zones/{zoneId}/leaderboard", response_model=list[LeaderboardEntry])
 def leaderboard(zoneId: str):
-    ensure_zone(zoneId)
+    with Session(engine) as session:
+        # sum per user in this zone
+        rows = session.execute(
+            select(Collected.user_id, func.coalesce(func.sum(Collected.awarded_points), 0).label("pts"))
+            .where(Collected.zone_id == zoneId)
+            .group_by(Collected.user_id)
+            .order_by(func.sum(Collected.awarded_points).desc())
+            .limit(50)
+        ).all()
 
-    # اجمع نقاط كل المستخدمين في هذا الزون
-    entries: List[LeaderboardEntry] = []
-    for (uid, zid), pts in points.items():
-        if zid != zoneId:
-            continue
-        u = users.get(uid)
-        if not u:
-            continue
-        entries.append(LeaderboardEntry(name=display_name(u), points=int(pts)))
+        out: list[LeaderboardEntry] = []
+        for user_id, pts in rows:
+            u = session.get(User, user_id)
+            name = u.name if u and u.name else "Guest"
+            out.append(LeaderboardEntry(name=name, points=int(pts)))
+        return out
 
-    # ترتيب تنازلي
-    entries.sort(key=lambda x: x.points, reverse=True)
 
-    # خذ أفضل 50
-    return entries[:50]
+# ============================================================
+# ✅ WorldMap (NEW) — per zone
+# ============================================================
+@app.post("/zones/{zoneId}/worldmap", response_model=OkResponse)
+def upsert_worldmap(zoneId: str, body: WorldMapUpsertReq):
+    # validate base64 quickly
+    try:
+        _ = base64.b64decode(body.mapBase64.encode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid base64")
+
+    with Session(engine) as session:
+        existing = session.get(ZoneWorldMap, zoneId)
+        if existing:
+            existing.map_b64 = body.mapBase64
+            existing.updated_at = datetime.utcnow()
+            session.add(existing)
+        else:
+            session.add(ZoneWorldMap(zone_id=zoneId, map_b64=body.mapBase64, updated_at=datetime.utcnow()))
+        session.commit()
+        return OkResponse(ok=True)
+
+
+@app.get("/zones/{zoneId}/worldmap", response_model=WorldMapResp)
+def get_worldmap(zoneId: str):
+    with Session(engine) as session:
+        wm = session.get(ZoneWorldMap, zoneId)
+        if not wm:
+            raise HTTPException(status_code=404, detail="worldmap not found")
+        return WorldMapResp(zoneId=zoneId, mapBase64=wm.map_b64, updatedAt=wm.updated_at.isoformat() + "Z")
