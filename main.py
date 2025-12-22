@@ -1,333 +1,280 @@
+# main.py
 import os
 import uuid
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, EmailStr
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 
 from sqlalchemy import (
     create_engine,
-    Column,
     String,
-    Boolean,
     Integer,
     DateTime,
-    UniqueConstraint,
     ForeignKey,
-    func,
+    UniqueConstraint,
+    text,
 )
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+from sqlalchemy.exc import IntegrityError
 
 
-# =========================
-# Config
-# =========================
+# -----------------------------
+# Database
+# -----------------------------
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
-# Neon often requires SSL. If your DATABASE_URL already includes sslmode=require, it's fine.
-# If not, you can append it. (Safe fallback)
+# Neon غالباً يحتاج SSL
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 if "sslmode=" not in DATABASE_URL:
     sep = "&" if "?" in DATABASE_URL else "?"
     DATABASE_URL = f"{DATABASE_URL}{sep}sslmode=require"
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+engine = create_engine(
+    DATABASE_URL,
+    pool_pre_ping=True,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-Base = declarative_base()
+
+class Base(DeclarativeBase):
+    pass
 
 
-# =========================
-# DB Models (UUID everywhere)
-# =========================
+# -----------------------------
+# Models (SQLAlchemy)
+# -----------------------------
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    device_id = Column(String, unique=True, nullable=False)
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    device_id: Mapped[str] = mapped_column(String(128), unique=True, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False, default="Guest")
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)  # بدون تحقق
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
-    name = Column(String, nullable=False, default="Guest")
-    email = Column(String, unique=True, nullable=True)
-
-    is_guest = Column(Boolean, nullable=False, default=True)
-    points = Column(Integer, nullable=False, default=0)
-    created_at = Column(DateTime, nullable=False, server_default=func.now())
-
-    collections = relationship("Collection", back_populates="user", cascade="all, delete-orphan")
-
-
-class Zone(Base):
-    __tablename__ = "zones"
-
-    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    join_code = Column(String, unique=True, nullable=False)
-
-    lat = Column(String, nullable=True)
-    lng = Column(String, nullable=True)
-    radius_m = Column(Integer, nullable=False, default=50)
-
-    name = Column(String, nullable=False, default="Zone")
-    created_at = Column(DateTime, nullable=False, server_default=func.now())
-
-    collections = relationship("Collection", back_populates="zone", cascade="all, delete-orphan")
+    collections: Mapped[List["Collection"]] = relationship(back_populates="user")
 
 
 class Collectible(Base):
     __tablename__ = "collectibles"
 
-    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    word = Column(String, nullable=False)  # e.g. "UI" / "UX" / "GOLD"
-    points = Column(Integer, nullable=False, default=10)
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    word: Mapped[str] = mapped_column(String(64), nullable=False)  # UI / UX / GOLD
+    points: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
 
-    created_at = Column(DateTime, nullable=False, server_default=func.now())
+    collections: Mapped[List["Collection"]] = relationship(back_populates="collectible")
 
-    collections = relationship("Collection", back_populates="collectible", cascade="all, delete-orphan")
+
+class Zone(Base):
+    __tablename__ = "zones"
+
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    collections: Mapped[List["Collection"]] = relationship(back_populates="zone")
 
 
 class Collection(Base):
-    """
-    A user collects a collectible in a zone.
-    NOTE: user_id, collectible_id, zone_id are UUID => matches referenced tables.
-    """
     __tablename__ = "collections"
     __table_args__ = (
         UniqueConstraint("user_id", "collectible_id", name="uq_user_collectible_once"),
     )
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
-    user_id = Column(PG_UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    collectible_id = Column(PG_UUID(as_uuid=True), ForeignKey("collectibles.id", ondelete="CASCADE"), nullable=False)
-    zone_id = Column(PG_UUID(as_uuid=True), ForeignKey("zones.id", ondelete="CASCADE"), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    collectible_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("collectibles.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("zones.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
 
-    awarded_points = Column(Integer, nullable=False, default=0)
-    collected_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    awarded_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    collected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
 
-    user = relationship("User", back_populates="collections")
-    collectible = relationship("Collectible", back_populates="collections")
-    zone = relationship("Zone", back_populates="collections")
+    user: Mapped[User] = relationship(back_populates="collections")
+    collectible: Mapped[Collectible] = relationship(back_populates="collections")
+    zone: Mapped[Zone] = relationship(back_populates="collections")
 
 
-# =========================
-# Pydantic Schemas
-# =========================
+# -----------------------------
+# Schemas (Pydantic)
+# -----------------------------
 class UserUpsertRequest(BaseModel):
-    device_id: str
+    device_id: str = Field(..., min_length=1)
     name: Optional[str] = "Guest"
-    email: Optional[EmailStr] = None
-
+    email: Optional[str] = None  # بدون EmailStr
 
 class UserResponse(BaseModel):
     id: str
     device_id: str
     name: str
     email: Optional[str] = None
-    is_guest: bool
-    points: int
-    created_at: datetime
 
-    class Config:
-        from_attributes = True
+class CollectibleCreate(BaseModel):
+    word: str
+    points: int = 1
 
-
-class ZoneCreateRequest(BaseModel):
-    join_code: str
-    name: Optional[str] = "Zone"
-    lat: Optional[str] = None
-    lng: Optional[str] = None
-    radius_m: int = 50
-
-
-class ZoneResponse(BaseModel):
-    id: str
-    join_code: str
+class ZoneCreate(BaseModel):
     name: str
-    lat: Optional[str] = None
-    lng: Optional[str] = None
-    radius_m: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
-
-class CollectibleCreateRequest(BaseModel):
-    word: str
-    points: int = 10
-
-
-class CollectibleResponse(BaseModel):
-    id: str
-    word: str
-    points: int
-    created_at: datetime
-
-    class Config:
-        from_attributes = True
-
+    description: Optional[str] = None
 
 class CollectRequest(BaseModel):
     device_id: str
-    collectible_id: str  # UUID string
-    zone_id: str         # UUID string
+    collectible_id: str
+    zone_id: str
 
 
-class CollectResponse(BaseModel):
-    ok: bool
-    awarded_points: int
-    user_points: int
-    message: str
-
-
-class LeaderboardItem(BaseModel):
-    user_id: str
-    name: str
-    points: int
-
-
-# =========================
+# -----------------------------
 # App
-# =========================
-app = FastAPI(title="VR API", version="1.0")
+# -----------------------------
+app = FastAPI(title="VR API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # عدّلها إذا تبي أمان أكثر
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
-def on_startup():
-    # Creates tables if not exist
+def on_startup() -> None:
+    # ينشئ الجداول إذا ما كانت موجودة
     Base.metadata.create_all(bind=engine)
 
+    # Seed بسيط لو فاضي
+    with SessionLocal() as db:
+        any_collectible = db.query(Collectible).first()
+        any_zone = db.query(Zone).first()
 
-def db_session():
-    db = SessionLocal()
+        if not any_collectible:
+            db.add_all([
+                Collectible(word="UI", points=1),
+                Collectible(word="UX", points=1),
+                Collectible(word="GOLD", points=5),
+            ])
+        if not any_zone:
+            db.add_all([
+                Zone(name="Clock Tower", description="Makkah vibes"),
+                Zone(name="Elm HQ", description="Office zone"),
+            ])
+        db.commit()
+
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def to_uuid(value: str, field_name: str) -> uuid.UUID:
     try:
-        yield db
-    finally:
-        db.close()
+        return uuid.UUID(value)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be a valid UUID")
 
 
-# =========================
+# -----------------------------
 # Routes
-# =========================
-@app.get("/")
-def root():
-    return {"status": "ok", "service": "VR API"}
+# -----------------------------
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return {"ok": True, "time": datetime.utcnow().isoformat()}
 
 
-# ---- Users ----
 @app.post("/users/upsert", response_model=UserResponse)
 def upsert_user(payload: UserUpsertRequest):
-    db = SessionLocal()
-    try:
+    with SessionLocal() as db:
         user = db.query(User).filter(User.device_id == payload.device_id).first()
         if user:
-            if payload.name:
-                user.name = payload.name
-            if payload.email:
-                user.email = str(payload.email)
-                user.is_guest = False
-            db.commit()
-            db.refresh(user)
-            return user
+            user.name = payload.name or user.name
+            user.email = payload.email  # بدون تحقق
+            user.updated_at = datetime.utcnow()
+        else:
+            user = User(
+                device_id=payload.device_id,
+                name=payload.name or "Guest",
+                email=payload.email,
+            )
+            db.add(user)
 
-        user = User(
-            device_id=payload.device_id,
-            name=payload.name or "Guest",
-            email=str(payload.email) if payload.email else None,
-            is_guest=(payload.email is None),
-        )
-        db.add(user)
         db.commit()
         db.refresh(user)
-        return user
-    finally:
-        db.close()
-
-
-@app.get("/users/by-device/{device_id}", response_model=UserResponse)
-def get_user_by_device(device_id: str):
-    db = SessionLocal()
-    try:
-        user = db.query(User).filter(User.device_id == device_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        return user
-    finally:
-        db.close()
-
-
-# ---- Zones ----
-@app.post("/zones", response_model=ZoneResponse)
-def create_zone(payload: ZoneCreateRequest):
-    db = SessionLocal()
-    try:
-        exists = db.query(Zone).filter(Zone.join_code == payload.join_code).first()
-        if exists:
-            raise HTTPException(status_code=409, detail="join_code already exists")
-
-        zone = Zone(
-            join_code=payload.join_code,
-            name=payload.name or "Zone",
-            lat=payload.lat,
-            lng=payload.lng,
-            radius_m=payload.radius_m,
+        return UserResponse(
+            id=str(user.id),
+            device_id=user.device_id,
+            name=user.name,
+            email=user.email,
         )
-        db.add(zone)
-        db.commit()
-        db.refresh(zone)
-        return zone
-    finally:
-        db.close()
 
 
-@app.get("/zones", response_model=List[ZoneResponse])
-def list_zones():
-    db = SessionLocal()
-    try:
-        return db.query(Zone).order_by(Zone.created_at.desc()).all()
-    finally:
-        db.close()
+@app.get("/collectibles")
+def list_collectibles():
+    with SessionLocal() as db:
+        items = db.query(Collectible).all()
+        return [{"id": str(x.id), "word": x.word, "points": x.points} for x in items]
 
 
-# ---- Collectibles ----
-@app.post("/collectibles", response_model=CollectibleResponse)
-def create_collectible(payload: CollectibleCreateRequest):
-    db = SessionLocal()
-    try:
+@app.post("/collectibles")
+def create_collectible(payload: CollectibleCreate):
+    with SessionLocal() as db:
         item = Collectible(word=payload.word, points=payload.points)
         db.add(item)
         db.commit()
         db.refresh(item)
-        return item
-    finally:
-        db.close()
+        return {"id": str(item.id), "word": item.word, "points": item.points}
 
 
-@app.get("/collectibles", response_model=List[CollectibleResponse])
-def list_collectibles():
-    db = SessionLocal()
-    try:
-        return db.query(Collectible).order_by(Collectible.created_at.desc()).all()
-    finally:
-        db.close()
+@app.get("/zones")
+def list_zones():
+    with SessionLocal() as db:
+        zones = db.query(Zone).all()
+        return [{"id": str(z.id), "name": z.name, "description": z.description} for z in zones]
 
 
-# ---- Collect action ----
-@app.post("/collect", response_model=CollectResponse)
+@app.post("/zones")
+def create_zone(payload: ZoneCreate):
+    with SessionLocal() as db:
+        z = Zone(name=payload.name, description=payload.description)
+        db.add(z)
+        db.commit()
+        db.refresh(z)
+        return {"id": str(z.id), "name": z.name, "description": z.description}
+
+
+@app.post("/collect")
 def collect(payload: CollectRequest):
-    db = SessionLocal()
-    try:
+    user_id = None
+    collectible_uuid = to_uuid(payload.collectible_id, "collectible_id")
+    zone_uuid = to_uuid(payload.zone_id, "zone_id")
+
+    with SessionLocal() as db:
         user = db.query(User).filter(User.device_id == payload.device_id).first()
         if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        try:
-            collectible_uuid = uuid.UUID(payload.collectible_id)
-            zone_uuid = uuid.UUID(payload.zone_id)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid UUID for collectible_id or zone_id")
+            raise HTTPException(status_code=404, detail="User not found (device_id)")
 
         collectible = db.query(Collectible).filter(Collectible.id == collectible_uuid).first()
         if not collectible:
@@ -337,55 +284,67 @@ def collect(payload: CollectRequest):
         if not zone:
             raise HTTPException(status_code=404, detail="Zone not found")
 
-        # Ensure user can only collect each collectible once
-        existing = (
-            db.query(Collection)
-            .filter(Collection.user_id == user.id, Collection.collectible_id == collectible.id)
-            .first()
-        )
-        if existing:
-            return CollectResponse(
-                ok=False,
-                awarded_points=0,
-                user_points=user.points,
-                message="Already collected this item before",
-            )
-
-        awarded = collectible.points
-
-        record = Collection(
+        row = Collection(
             user_id=user.id,
             collectible_id=collectible.id,
             zone_id=zone.id,
-            awarded_points=awarded,
+            awarded_points=collectible.points,
             collected_at=datetime.utcnow(),
         )
-        db.add(record)
+        db.add(row)
 
-        user.points += awarded
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            # هذا يعني نفس user جمع نفس collectible قبل (UniqueConstraint)
+            raise HTTPException(status_code=409, detail="Already collected")
 
-        db.commit()
-        db.refresh(user)
-
-        return CollectResponse(
-            ok=True,
-            awarded_points=awarded,
-            user_points=user.points,
-            message="Collected successfully",
-        )
-    finally:
-        db.close()
+        return {
+            "ok": True,
+            "awarded_points": collectible.points,
+            "collectible": {"id": str(collectible.id), "word": collectible.word},
+            "zone": {"id": str(zone.id), "name": zone.name},
+        }
 
 
-# ---- Leaderboard ----
-@app.get("/leaderboard", response_model=List[LeaderboardItem])
-def leaderboard(limit: int = 50):
-    db = SessionLocal()
-    try:
-        users = db.query(User).order_by(User.points.desc(), User.created_at.asc()).limit(limit).all()
-        return [
-            LeaderboardItem(user_id=str(u.id), name=u.name, points=u.points)
-            for u in users
-        ]
-    finally:
-        db.close()
+@app.get("/users/{device_id}/score")
+def get_score(device_id: str):
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.device_id == device_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        total = db.execute(
+            text(
+                """
+                SELECT COALESCE(SUM(awarded_points), 0) AS total_points
+                FROM collections
+                WHERE user_id = :uid
+                """
+            ),
+            {"uid": str(user.id)},
+        ).scalar_one()
+
+        return {"device_id": device_id, "user_id": str(user.id), "points": int(total)}
+
+
+@app.get("/leaderboard")
+def leaderboard(limit: int = 10):
+    limit = max(1, min(limit, 100))
+    with SessionLocal() as db:
+        rows = db.execute(
+            text(
+                """
+                SELECT u.name, u.device_id, COALESCE(SUM(c.awarded_points), 0) AS points
+                FROM users u
+                LEFT JOIN collections c ON c.user_id = u.id
+                GROUP BY u.id
+                ORDER BY points DESC
+                LIMIT :lim
+                """
+            ),
+            {"lim": limit},
+        ).mappings().all()
+
+        return [{"name": r["name"], "device_id": r["device_id"], "points": int(r["points"])} for r in rows]
