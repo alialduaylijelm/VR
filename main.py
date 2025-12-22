@@ -281,6 +281,32 @@ def user_points(user_id: str, zoneId: str = Query(...)):
 
         return {"points": int(total)}
 
+@app.get("/users/{device_id}/score")
+def user_score_by_device(device_id: str, zoneId: Optional[str] = None):
+    with SessionLocal() as db:
+        u = db.query(User).filter(User.device_id == device_id).first()
+        if not u:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        params = {"uid": str(u.id)}
+        sql = """
+            SELECT COALESCE(SUM(awarded_points), 0) AS total_points
+            FROM collections
+            WHERE user_id = :uid
+        """
+
+        if zoneId:
+            zid = to_uuid(zoneId, "zoneId")
+            sql += " AND zone_id = :zid"
+            params["zid"] = str(zid)
+
+        total = db.execute(text(sql), params).scalar_one()
+        return {
+            "deviceId": device_id,
+            "userId": str(u.id),
+            "points": int(total)
+        }
+
 # -----------------------------
 # Zones Auto (اختياري - Swift يناديه أحياناً)
 # -----------------------------
