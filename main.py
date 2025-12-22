@@ -221,13 +221,46 @@ def to_uuid(value: str, field_name: str) -> uuid.UUID:
     except Exception:
         raise HTTPException(status_code=400, detail=f"{field_name} must be a valid UUID")
 
+
+# ✅ ADDED: seed zones (بدون أي تغيير على API)
+SEED_ZONES = [
+    # Althuraya (1..5)
+    ("d1b291c4-af85-46f6-ab8b-1ac9c91c191e", "Althuraya - Floor 1"),
+    ("4b525a2e-1de9-4b8d-b8dd-717ec2aae244", "Althuraya - Floor 2"),
+    ("551c435d-bc1c-486a-8501-9fbd31dd277c", "Althuraya - Floor 3"),
+    ("6db7f30e-bac1-49c8-868e-5645f9d23d44", "Althuraya - Floor 4"),
+    ("1e0597d3-b8c3-4dc8-b3d7-63da420e66a9", "Althuraya - Floor 5"),
+
+    # Hittin (1..3)
+    ("a82aba6d-0d14-4171-8b73-272c2297d8c9", "Hittin - Floor 1"),
+    ("e832744f-47a8-4791-bfe0-759ff37c5b4e", "Hittin - Floor 2"),
+    ("930970ff-28c8-4c55-a712-205b36580658", "Hittin - Floor 3"),
+
+    # Suhail (1..8)
+    ("6fede465-e780-4e76-b462-129ab71bde66", "Suhail - Floor 1"),
+    ("13cd952d-9a03-44dd-9af2-cb391537139c", "Suhail - Floor 2"),
+    ("b650349d-2546-42de-8129-3812e0718146", "Suhail - Floor 3"),
+    ("62f65610-3f99-49e1-a944-7c49a7e936e6", "Suhail - Floor 4"),
+    ("e0e29611-3ae8-4d6c-a8e7-4fc27a16875c", "Suhail - Floor 5"),
+    ("0b0e5e4c-9153-4135-a57d-abcc230ee7d7", "Suhail - Floor 6"),
+    ("7a38a57f-57ba-4b12-a838-4a84b86fd600", "Suhail - Floor 7"),
+    ("cbe1cb7b-670a-4ed9-b516-a82be0bf5bd6", "Suhail - Floor 8"),
+]
+
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
     print("✅ startup: tables created")
-    # ... seed loop ...
 
+    # ✅ ADDED: seed loop (يضمن zones موجودة عشان ما يطلع Zone not found)
     with SessionLocal() as db:
+        for zid, name in SEED_ZONES:
+            zone_uuid = uuid.UUID(zid)
+            existing = db.query(Zone).filter(Zone.id == zone_uuid).first()
+            if not existing:
+                db.add(Zone(id=zone_uuid, name=name, description=None))
+        db.commit()
+
         count = db.query(Zone).count()
         print("✅ startup: zones count =", count)
 
@@ -288,6 +321,8 @@ def user_points(user_id: str, zoneId: str = Query(...)):
 
         return {"points": int(total)}
 
+# ✅ ADDED: endpoint expected by Swift: GET /users/{device_id}/score
+# (اختياري zoneId لو تبغى نقاط Zone معيّن)
 @app.get("/users/{device_id}/score")
 def user_score_by_device(device_id: str, zoneId: Optional[str] = None):
     with SessionLocal() as db:
