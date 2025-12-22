@@ -224,6 +224,13 @@ def to_uuid(value: str, field_name: str) -> uuid.UUID:
 @app.on_event("startup")
 def on_startup():
     Base.metadata.create_all(bind=engine)
+    print("✅ startup: tables created")
+    # ... seed loop ...
+
+    with SessionLocal() as db:
+        count = db.query(Zone).count()
+        print("✅ startup: zones count =", count)
+
 
 @app.get("/health")
 def health():
