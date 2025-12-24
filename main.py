@@ -191,7 +191,9 @@ class CollectibleDTO(BaseModel):
     worldMapId: Optional[str] = None
 
 class LeaderboardEntry(BaseModel):
+    userId: str
     name: str
+    isGuest: bool
     points: int
 
 class UploadWorldMapReq(BaseModel):
@@ -447,25 +449,56 @@ def collect(collectible_id: str, userId: str = Query(...)):
 # Leaderboard per Zone
 # -----------------------------
 @app.get("/zones/{zone_id}/leaderboard", response_model=List[LeaderboardEntry])
-def leaderboard(zone_id: str, limit: int = 10):
+def leaderboard(zone_id: str, limit: int = 10, scope: str = "zone"):
     zid = to_uuid(zone_id, "zoneId")
     limit = max(1, min(limit, 100))
+    scope = (scope or "zone").lower()
 
     with SessionLocal() as db:
-        rows = db.execute(
-            text("""
-                SELECT u.name, COALESCE(SUM(c.awarded_points), 0) AS points
-                FROM users u
-                LEFT JOIN collections c
-                  ON c.user_id = u.id AND c.zone_id = :zid
-                GROUP BY u.id
-                ORDER BY points DESC
-                LIMIT :lim
-            """),
-            {"zid": str(zid), "lim": limit},
-        ).mappings().all()
+        if scope == "global":
+            rows = db.execute(
+                text("""
+                    SELECT
+                        u.id AS user_id,
+                        u.name,
+                        u.is_guest,
+                        COALESCE(SUM(c.awarded_points), 0) AS points
+                    FROM users u
+                    LEFT JOIN collections c
+                      ON c.user_id = u.id
+                    GROUP BY u.id
+                    ORDER BY points DESC, u.created_at ASC
+                    LIMIT :lim
+                """),
+                {"lim": limit},
+            ).mappings().all()
+        else:
+            rows = db.execute(
+                text("""
+                    SELECT
+                        u.id AS user_id,
+                        u.name,
+                        u.is_guest,
+                        COALESCE(SUM(c.awarded_points), 0) AS points
+                    FROM users u
+                    LEFT JOIN collections c
+                      ON c.user_id = u.id AND c.zone_id = :zid
+                    GROUP BY u.id
+                    ORDER BY points DESC, u.created_at ASC
+                    LIMIT :lim
+                """),
+                {"zid": str(zid), "lim": limit},
+            ).mappings().all()
 
-        return [LeaderboardEntry(name=r["name"], points=int(r["points"])) for r in rows]
+        return [
+            LeaderboardEntry(
+                userId=str(r["user_id"]),
+                name=r["name"],
+                isGuest=bool(r["is_guest"]),
+                points=int(r["points"]),
+            )
+            for r in rows
+        ]
 
 # -----------------------------
 # WorldMap endpoints (Swift expects /worldmap and /worldmaps)
